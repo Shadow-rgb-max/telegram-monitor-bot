@@ -1,0 +1,18 @@
+services:
+  tg-keyword-monitor:
+    build: .
+    container_name: tg-keyword-monitor
+    restart: unless-stopped
+    volumes:
+      - ./config.ini:/app/config.ini
+      - ./config.key:/app/config.key
+      - ./bot_session.session:/app/bot_session.session
+      - ./channel_cache.json:/app/channel_cache.json
+      - ./bot.log:/app/bot.log
+    environment:
+      - PYTHONUNBUFFERED=1
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

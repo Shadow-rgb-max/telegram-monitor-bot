@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram Keyword Monitor Docker
+After=network.target
+
+[Service]
+Restart=always
+ExecStart=/usr/bin/docker run --rm \
+  --name tg-keyword-monitor \
+  -v /home/lentum/progs/tgkeyw-dmonitor-2.1.0-tg64/config.ini:/app/config.ini \
+  -v /home/lentum/progs/tgkeyw-dmonitor-2.1.0-tg64/config.key:/app/config.key \
+  tg-keyword-monitor:latest
+ExecStop=/usr/bin/docker stop tg-keyword-monitor
+
+[Install]
+WantedBy=multi-user.target

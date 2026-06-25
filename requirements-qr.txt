@@ -1,0 +1,2 @@
+# Для create_telethon_session_qr.py (опционально, для отображения QR-кода)
+qrcode[pil]

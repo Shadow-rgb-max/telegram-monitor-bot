@@ -1,0 +1,10 @@
+[Telegram]
+api_id = your_api_id_here
+api_hash = your_api_hash_here
+admin_id = 123456789
+channel_id = @your_notification_channel
+
+[Settings]
+channels = @channel1, @channel2, @channel3
+keywords = 100%, бесплатно, скидка, акция
+dedup_window_hours = 24 

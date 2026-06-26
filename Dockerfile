@@ -1,16 +1,20 @@
-# Используем официальный Python-образ (slim версия для меньшего размера и быстрой загрузки)
 FROM python:3.11-slim
 
 WORKDIR /app
-COPY . /app
 
-# Установка зависимостей Python
+# Устанавливаем системные зависимости для TgCrypto и Pyrogram
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libffi-dev \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Установка supervisor
-RUN apt-get update && apt-get install -y supervisor && rm -rf /var/lib/apt/lists/*
+COPY . .
 
-# Копируем конфиг supervisord внутрь контейнера
-COPY supervisord.conf /etc/supervisord.conf
+# Создаём директорию для сессии
+RUN mkdir -p /app
 
-CMD ["/usr/bin/supervisord", "-c", "/etc/supervisord.conf"] 
+CMD ["python3", "main.py"]

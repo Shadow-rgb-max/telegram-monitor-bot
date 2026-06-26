@@ -1,7 +1,7 @@
 import asyncio
 from config import get_config
 from logger import setup_logger
-from telegram_client import TelegramKeywordBot
+from pyrogram_client import PyrogramKeywordBot
 
 
 def main() -> None:
@@ -11,15 +11,15 @@ def main() -> None:
     except Exception as e:
         logger.error(f"Ошибка чтения конфигурации: {e}")
         return
-    bot = TelegramKeywordBot(config, logger)
+
+    bot = PyrogramKeywordBot(config, logger)
+
     try:
-        asyncio.get_event_loop().run_until_complete(bot.start())
+        asyncio.run(bot.start())
     except KeyboardInterrupt:
-        logger.info("Бот остановлен пользователем")
-        asyncio.get_event_loop().run_until_complete(bot.shutdown())
+        logger.info("Бот остановлен пользователем (Ctrl+C)")
     except Exception as e:
         logger.error(f"Критическая ошибка: {e}")
-        asyncio.get_event_loop().run_until_complete(bot.shutdown())
 
 
 if __name__ == "__main__":

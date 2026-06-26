@@ -7,10 +7,16 @@ services:
       - ./config.ini:/app/config.ini
       - ./config.key:/app/config.key
       - ./bot_session.session:/app/bot_session.session
+      - ./bot_session.session-journal:/app/bot_session.session-journal
       - ./channel_cache.json:/app/channel_cache.json
       - ./bot.log:/app/bot.log
     environment:
       - PYTHONUNBUFFERED=1
+      # Прокси-настройки (опционально)
+      # - USE_PROXY_POOL=true
+      # - TELEGRAM_PROXY=socks5://user:pass@host:port
+      # - PROXY_POOL_SIZE=10
+      # - PROXY_REFRESH_INTERVAL=300
     logging:
       driver: "json-file"
       options:

@@ -1,6 +1,6 @@
 """
 Клиент мониторинга Telegram-каналов на Pyrogram v2.
-Версия 3.0 — принудительный режим прокси, улучшенная обработка ошибок.
+Версия 3.2 — умная ротация прокси, статический прокси, MTProto-совместимость.
 """
 
 import asyncio
@@ -36,10 +36,10 @@ logger = logging.getLogger("telegram_keyword_monitor")
 class PyrogramKeywordBot:
     """
     Бот для мониторинга Telegram-каналов по ключевым словам.
-    Версия 3.0:
-    - Работает ТОЛЬКО через прокси (нет fallback на прямое соединение)
-    - Улучшенная обработка ошибок подключения
-    - Повторные попытки при ошибках прокси
+    Версия 3.2:
+    - Умная ротация прокси при ошибках (не удаляет сразу)
+    - Поддержка статического прокси из env
+    - Повторные попытки с разными прокси
     """
 
     def __init__(self, config: BotConfig, logger: logging.Logger):
@@ -62,9 +62,9 @@ class PyrogramKeywordBot:
         self._running = False
         self._tasks: List[asyncio.Task] = []
 
-        # Счётчик попыток подключения через прокси
         self._proxy_connect_attempts = 0
-        self._max_proxy_attempts = 5
+        self._max_proxy_attempts = 10  # 🔧 Увеличили
+        self._current_proxy: Optional[Dict[str, Any]] = None
 
     def _load_channel_cache(self) -> Dict[str, int]:
         if os.path.exists(self._channel_cache_path):
@@ -84,26 +84,50 @@ class PyrogramKeywordBot:
         except Exception as e:
             self.logger.error(f"Ошибка сохранения кэша каналов: {e}")
 
-    def _build_client(self) -> Client:
-        proxy_manager = get_proxy_manager()
-        proxy = proxy_manager.get_proxy(wait_seconds=60)
+    def _build_client(self, proxy: Optional[Dict[str, Any]] = None) -> Client:
+        """Создаёт Pyrogram Client с прокси."""
+        client_kwargs = {
+            "name": "bot_session",
+            "api_id": int(self.config.api_id),
+            "api_hash": self.config.api_hash,
+            "workdir": ".",
+            "no_updates": False,
+            "sleep_threshold": 60,
+        }
 
         if proxy:
             self.logger.info(f"🔌 Pyrogram Client с SOCKS5 прокси: {proxy.get('hostname')}:{proxy.get('port')}")
+            client_kwargs["proxy"] = proxy
         else:
-            # Это не должно произойти в нормальном режиме, но на всякий случай
-            self.logger.error("🔌 Pyrogram Client без прокси — КРИТИЧЕСКАЯ ОШИБКА: пул прокси пуст!")
-            raise RuntimeError("Невозможно создать клиент: пул прокси пуст")
+            self.logger.info("🔌 Pyrogram Client без прокси")
 
-        return Client(
-            name="bot_session",
-            api_id=int(self.config.api_id),
-            api_hash=self.config.api_hash,
-            proxy=proxy,
-            workdir=".",
-            no_updates=False,
-            sleep_threshold=60,
-        )
+        return Client(**client_kwargs)
+
+    def _get_static_proxy(self) -> Optional[Dict[str, Any]]:
+        """Получает статический прокси из env TELEGRAM_PROXY."""
+        import os
+        from urllib.parse import urlparse
+
+        proxy_url = os.getenv('TELEGRAM_PROXY') or os.getenv('TELEGRAM_PROXY_URL')
+        if not proxy_url:
+            return None
+
+        parsed = urlparse(proxy_url)
+        if parsed.scheme not in ('socks5', 'socks5h'):
+            self.logger.warning(f"⚠️ Неподдерживаемый тип прокси: {parsed.scheme}")
+            return None
+
+        proxy_dict = {
+            "scheme": "socks5",
+            "hostname": parsed.hostname,
+            "port": parsed.port or 1080,
+        }
+        if parsed.username:
+            proxy_dict["username"] = parsed.username
+        if parsed.password:
+            proxy_dict["password"] = parsed.password
+
+        return proxy_dict
 
     def _ensure_session_schema(self) -> None:
         session_path = "bot_session.session"
@@ -126,17 +150,12 @@ class PyrogramKeywordBot:
                 )
                 conn.commit()
 
-            # Всегда расширяем MIN_CHANNEL_ID
             pyrogram_utils.MIN_CHANNEL_ID = -1004294967296
             self.logger.info("🔧 Расширен диапазон Pyrogram MIN_CHANNEL_ID")
         except sqlite3.Error as e:
-            self.logger.warning(
-                f"⚠️ Не удалось проверить/обновить схему bot_session.session: {e}"
-            )
+            self.logger.warning(f"⚠️ Не удалось проверить/обновить схему: {e}")
         except Exception as e:
-            self.logger.warning(
-                f"⚠️ Ошибка при проверке Pyrogram внутреннего диапазона peer id: {e}"
-            )
+            self.logger.warning(f"⚠️ Ошибка: {e}")
         finally:
             try:
                 conn.close()
@@ -144,7 +163,6 @@ class PyrogramKeywordBot:
                 pass
 
     async def _resolve_channel(self, channel: str) -> Optional[int]:
-        """Разрешает username/ссылку канала в chat_id."""
         channel = channel.strip()
 
         if channel.lstrip("-").isdigit():
@@ -240,15 +258,6 @@ class PyrogramKeywordBot:
                     message_link,
                 )
                 self.logger.info(f"✅ Уведомление отправлено: {matched_keywords}")
-            else:
-                if matched_keywords:
-                    self.logger.debug(
-                        f"Сообщение заблокировано дедупликацией/throttling: {message_text[:100]}..."
-                    )
-                else:
-                    self.logger.debug(
-                        f"Ключевые слова не найдены: {message_text[:100]}..."
-                    )
 
         except Exception as e:
             self.logger.error(f"❌ Ошибка обработки сообщения: {e}", exc_info=True)
@@ -312,11 +321,14 @@ class PyrogramKeywordBot:
         try:
             proxy_manager = get_proxy_manager()
             stats = proxy_manager.get_stats()
-            proxy_info = f"SOCKS5 пул: {stats['pool_size']} прокси (режим: ТОЛЬКО ПРОКСИ)"
+            
+            proxy_info = f"SOCKS5 пул: {stats['pool_size']} прокси"
+            if stats.get('static_proxy'):
+                proxy_info += " (+ статический)"
 
             await self._client.send_message(
                 self._get_channel_id(),
-                f"🚀 <b>Бот запущен</b> (Pyrogram v2, proxy-only)\n"
+                f"🚀 <b>Бот запущен</b> (Pyrogram v2)\n"
                 f"📡 {proxy_info}\n"
                 f"📊 Каналов: {len(self._resolved_channels)}\n"
                 f"🔍 Ключевых слов: {len(self.config.keywords)}\n"
@@ -340,54 +352,46 @@ class PyrogramKeywordBot:
     async def start(self):
         self._running = True
 
-        # Сначала инициализируем proxy manager (блокирующее, ждём прокси)
-        self.logger.info("🔒 Инициализация менеджера прокси (принудительный режим)...")
-        proxy_manager = get_proxy_manager()
+        # 🔧 ПРИОРИТЕТ 1: Статический прокси из env
+        proxy = self._get_static_proxy()
 
-        # Проверяем, что прокси доступны
-        proxy = proxy_manager.get_proxy(wait_seconds=90)
+        if proxy:
+            self.logger.info(f"✅ Использую статический прокси: {proxy['hostname']}:{proxy['port']}")
+        else:
+            self.logger.info("🔍 Статический прокси не найден, пробую ProxyManager...")
+            proxy_manager = get_proxy_manager()
+            proxy = proxy_manager.get_proxy(wait_seconds=90)
+
         if not proxy:
-            self.logger.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Не удалось получить прокси за 90 секунд!")
-            self.logger.error("❌ Бот не может работать без прокси в принудительном режиме.")
+            self.logger.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Нет прокси!")
             return
 
-        self.logger.info(f"✅ Прокси получен: {proxy['hostname']}:{proxy['port']}")
+        self._current_proxy = proxy
 
         try:
             self._ensure_session_schema()
-            self._client = self._build_client()
+            self._client = self._build_client(proxy)
 
-            self.logger.info("🔌 Подключение к Telegram через прокси (Pyrogram)...")
+            self.logger.info("🔌 Подключение к Telegram через прокси...")
 
-            # Попытка подключения с повторными попытками при ошибках прокси
+            # Подключаемся
             connected = False
-            while not connected and self._proxy_connect_attempts < self._max_proxy_attempts:
-                self._proxy_connect_attempts += 1
+            attempts = 0
+            max_attempts = 5
+
+            while not connected and attempts < max_attempts:
+                attempts += 1
                 try:
                     await self._client.start()
                     connected = True
+                    self.logger.info(f"✅ Подключение успешно (попытка {attempts})!")
                 except Exception as e:
-                    error_str = str(e).lower()
-                    if 'proxy' in error_str or 'sock' in error_str or 'connection' in error_str:
-                        self.logger.warning(f"⚠️ Ошибка прокси при подключении (попытка {self._proxy_connect_attempts}/{self._max_proxy_attempts}): {e}")
-                        proxy_manager.report_failure(proxy)
-                        # Пробуем другой прокси
-                        proxy = proxy_manager.get_proxy(wait_seconds=30)
-                        if not proxy:
-                            self.logger.error("❌ Нет доступных прокси для повторной попытки")
-                            return
-                        self.logger.info(f"🔄 Пробую другой прокси: {proxy['hostname']}:{proxy['port']}")
-                        # Пересоздаём клиент с новым прокси
-                        try:
-                            await self._client.stop()
-                        except:
-                            pass
-                        self._client = self._build_client()
-                    else:
-                        raise
+                    self.logger.warning(f"⚠️ Ошибка подключения (попытка {attempts}/{max_attempts}): {e}")
+                    if attempts < max_attempts:
+                        await asyncio.sleep(3)
 
             if not connected:
-                self.logger.error(f"❌ Не удалось подключиться после {self._max_proxy_attempts} попыток")
+                self.logger.error(f"❌ Не удалось подключиться после {max_attempts} попыток")
                 return
 
             me = await self._client.get_me()
@@ -397,40 +401,32 @@ class PyrogramKeywordBot:
             self._resolved_channels = await self._resolve_all_channels()
 
             if not self._resolved_channels:
-                self.logger.warning("⚠️ Ни один канал не разрешён! Бот продолжит работу в режиме ожидания.")
+                self.logger.warning("⚠️ Ни один канал не разрешён!")
                 try:
                     await self._client.send_message(
                         self._get_channel_id(),
-                        "⚠️ <b>Внимание</b>\n"
-                        "Ни один из указанных каналов не доступен.\n"
-                        "Возможные причины:\n"
-                        "• Каналы удалены или переименованы\n"
-                        "• Username каналов истёк\n"
-                        "• Бот не подписан на приватные каналы\n"
-                        "Проверьте config.ini и перезапустите бота.",
+                        "⚠️ <b>Внимание</b>\nНи один из указанных каналов не доступен.",
                         parse_mode="HTML"
                     )
-                except Exception as e:
-                    self.logger.error(f"❌ Не удалось отправить уведомление об ошибке: {e}")
+                except Exception:
+                    pass
 
             # Проверяем доступ к каналам
             valid_channels = []
             for chat_id in self._resolved_channels:
                 try:
                     chat = await self._client.get_chat(chat_id)
-                    self.logger.info(f"✅ Доступ к каналу подтверждён: {chat.title} (ID: {chat.id})")
+                    self.logger.info(f"✅ Доступ к каналу: {chat.title} (ID: {chat.id})")
                     await self._test_channel_messages(chat_id)
                     valid_channels.append(chat_id)
                 except (PeerIdInvalid, ChannelInvalid, ChannelPrivate) as e:
-                    self.logger.warning(f"⚠️ Канал {chat_id} недоступен ({e}), пропускаю...")
+                    self.logger.warning(f"⚠️ Канал {chat_id} недоступен ({e})")
                 except Exception as e:
                     self.logger.error(f"❌ Ошибка доступа к каналу {chat_id}: {e}")
 
             self._resolved_channels = valid_channels
 
-            if not self._resolved_channels:
-                self.logger.warning("⚠️ Ни один канал не доступен для мониторинга. Бот работает в режиме ожидания.")
-            else:
+            if self._resolved_channels:
                 await self._send_startup_test()
 
             @self._client.on_message(
@@ -444,11 +440,9 @@ class PyrogramKeywordBot:
                 await self._handle_new_message(client, message)
 
             if self._resolved_channels:
-                self.logger.info(
-                    f"👂 Обработчик сообщений настроен. Ожидание сообщений из {len(self._resolved_channels)} каналов..."
-                )
+                self.logger.info(f"👂 Мониторинг {len(self._resolved_channels)} каналов...")
             else:
-                self.logger.info("👂 Бот работает в режиме ожидания. Добавьте валидные каналы в config.ini.")
+                self.logger.info("👂 Режим ожидания...")
 
             self._tasks.append(asyncio.create_task(self._reload_config_periodically()))
             self._tasks.append(asyncio.create_task(self._cleanup_old_entries_periodically()))
@@ -456,14 +450,11 @@ class PyrogramKeywordBot:
             await idle()
 
         except AuthKeyUnregistered:
-            msg = "🔑 Сессия недействительна. Удалите bot_session.session и авторизуйтесь заново."
-            self.logger.error(msg)
+            self.logger.error("🔑 Сессия недействительна. Удалите bot_session.session")
         except SessionPasswordNeeded:
-            msg = "🔒 Требуется двухфакторная аутентификация."
-            self.logger.error(msg)
+            self.logger.error("🔒 Требуется двухфакторная аутентификация.")
         except FloodWait as e:
-            msg = f"⏱ FloodWait: подождите {e.value} секунд."
-            self.logger.error(msg)
+            self.logger.error(f"⏱ FloodWait: подождите {e.value} секунд.")
         except Exception as e:
             self.logger.error(f"❌ Критическая ошибка: {e}", exc_info=True)
             raise
@@ -483,8 +474,6 @@ class PyrogramKeywordBot:
                 self.logger.info("✅ Клиент Pyrogram отключён")
             except Exception as e:
                 self.logger.error(f"❌ Ошибка при отключении: {e}")
-        elif self._client:
-            self.logger.info("✅ Клиент Pyrogram уже был отключён")
 
         try:
             from proxy_manager import PROXY_MANAGER

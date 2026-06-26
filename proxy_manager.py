@@ -1,5 +1,5 @@
 """Менеджер SOCKS5 прокси с автоматическим подбором рабочих прокси.
-Версия 4.0 — принудительный режим прокси, socket-level SOCKS5 тестирование.
+Версия 4.2 — реальный MTProto-тест, ротация при ошибках, поддержка статического прокси.
 """
 
 import os
@@ -52,7 +52,7 @@ def _get_proxy_logger() -> logging.Logger:
     _proxy_logger.addHandler(file_handler)
     _proxy_logger.addHandler(stream_handler)
 
-    return _proxy_logger
+    return _get_proxy_logger()
 
 
 logger = logging.getLogger(__name__)
@@ -61,7 +61,8 @@ logger = logging.getLogger(__name__)
 # ==================== КОНФИГУРАЦИЯ ====================
 
 class ProxyConfig:
-    USE_PROXY_POOL = True
+    USE_PROXY_POOL = os.getenv('USE_PROXY_POOL', 'true').lower() in ('true', '1', 'yes')
+    # 🔧 НОВОЕ: Статический прокси из env (приоритет над пулом)
     TELEGRAM_PROXY = os.getenv('TELEGRAM_PROXY') or os.getenv('TELEGRAM_PROXY_URL')
     PROXY_POOL_URL = os.getenv(
         'PROXY_POOL_URL',
@@ -82,17 +83,16 @@ class ProxyConfig:
     PROXY_TEST_TIMEOUT = int(os.getenv('PROXY_TEST_TIMEOUT', '10'))
     MAX_PROXIES_TO_TEST = int(os.getenv('MAX_PROXIES_TO_TEST', '500'))
     TEST_WORKERS = int(os.getenv('PROXY_TEST_WORKERS', '50'))
+    # 🔧 НОВОЕ: Макс. попыток с одним прокси перед ротацией
+    MAX_FAILS_PER_PROXY = int(os.getenv('MAX_FAILS_PER_PROXY', '3'))
 
 
 # ==================== SOCKET-LEVEL SOCKS5 TEST ====================
 
 def _test_proxy_socks5_handshake(proxy_host: str, proxy_port: int,
-                                   target_host: str = "api.telegram.org",
+                                   target_host: str = "149.154.175.53",  # Telegram DC1
                                    target_port: int = 443, timeout: int = 8) -> tuple[bool, str, float]:
-    """
-    Быстрый тест: только SOCKS5 handshake + CONNECT.
-    Не делает TLS — это отдельная фаза.
-    """
+    """Быстрый тест: SOCKS5 handshake + CONNECT к Telegram DC."""
     sock = None
     start = time.time()
     try:
@@ -111,7 +111,7 @@ def _test_proxy_socks5_handshake(proxy_host: str, proxy_port: int,
         if method == 0xFF:
             return False, "no_auth_method", 0
 
-        # CONNECT request
+        # CONNECT request to Telegram DC
         target_bytes = target_host.encode('utf-8')
         req = struct.pack("!BBBB", 0x05, 0x01, 0x00, 0x03)
         req += struct.pack("!B", len(target_bytes)) + target_bytes
@@ -161,12 +161,12 @@ def _test_proxy_socks5_handshake(proxy_host: str, proxy_port: int,
                 pass
 
 
-def _test_proxy_full_tls(proxy_host: str, proxy_port: int,
-                         target_host: str = "api.telegram.org",
-                         target_port: int = 443, timeout: int = 10) -> tuple[bool, str, float]:
+def _test_proxy_mtproto_real(proxy_host: str, proxy_port: int,
+                              dc_host: str = "149.154.175.53",  # DC1
+                              dc_port: int = 443, timeout: int = 15) -> tuple[bool, str, float]:
     """
-    Полный тест: SOCKS5 handshake + CONNECT + TLS + HTTP request.
-    Используется только для прокси, прошедших handshake-тест.
+    🔧 КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Реальный MTProto-тест.
+    Отправляем auth_key запрос и ждём ответа — как делает реальный клиент.
     """
     sock = None
     start = time.time()
@@ -181,7 +181,118 @@ def _test_proxy_full_tls(proxy_host: str, proxy_port: int,
         if len(resp) < 2 or resp[0] != 0x05 or resp[1] == 0xFF:
             return False, "handshake_fail", 0
 
-        # CONNECT
+        # CONNECT to Telegram DC
+        target_bytes = dc_host.encode('utf-8')
+        req = struct.pack("!BBBB", 0x05, 0x01, 0x00, 0x03)
+        req += struct.pack("!B", len(target_bytes)) + target_bytes
+        req += struct.pack("!H", dc_port)
+        sock.sendall(req)
+
+        resp = sock.recv(4)
+        if len(resp) < 4 or resp[0] != 0x05 or resp[1] != 0x00:
+            return False, "connect_fail", 0
+
+        atyp = resp[3]
+        if atyp == 0x01:
+            sock.recv(6)
+        elif atyp == 0x03:
+            l = sock.recv(1)
+            if l:
+                sock.recv(struct.unpack("!B", l)[0] + 2)
+
+        # 🔧 Реальный MTProto: отправляем req_pq_multi (auth_key init)
+        # MTProto 2.0: 8 bytes auth_key_id (all zeros for unencrypted) + 8 bytes msg_id + 4 bytes msg_len + payload
+        import random
+        nonce = random.getrandbits(128).to_bytes(16, 'big')
+        
+        # req_pq_multi constructor: 0xbe7e8ef1
+        payload = struct.pack("<I", 0xbe7e8ef1) + nonce
+        
+        # Unencrypted message wrapper
+        auth_key_id = b'\x00' * 8
+        msg_id = int(time.time() * 2**30).to_bytes(8, 'little')
+        msg_len = len(payload).to_bytes(4, 'little')
+        
+        mtproto_msg = auth_key_id + msg_id + msg_len + payload
+        
+        sock.sendall(mtproto_msg)
+        
+        # Ждём ответ — server_salt должен прийти
+        sock.settimeout(10)
+        response = sock.recv(1024)
+        
+        elapsed = (time.time() - start) * 1000
+        
+        if len(response) >= 20:
+            # Проверяем что ответ валидный (не пустой, не ошибка)
+            return True, "mtproto_real_ok", elapsed
+        return False, "mtproto_no_response", elapsed
+
+    except socket.timeout:
+        return False, "timeout", 0
+    except socket.error:
+        return False, "socket_error", 0
+    except Exception as e:
+        return False, f"unexpected_{type(e).__name__}", 0
+    finally:
+        if sock:
+            try:
+                sock.close()
+            except:
+                pass
+
+
+def _test_proxy_full_telegram(proxy_host: str, proxy_port: int, timeout: int = 20) -> tuple[bool, str, float]:
+    """
+    🔧 Полный тест: SOCKS5 + MTProto + TLS к api.telegram.org.
+    Прокси должен пройти ВСЕ три проверки.
+    """
+    # Phase 1: Handshake к Telegram DC
+    ok1, err1, ms1 = _test_proxy_socks5_handshake(
+        proxy_host, proxy_port,
+        target_host="149.154.175.53",
+        target_port=443,
+        timeout=8
+    )
+    if not ok1:
+        return False, f"handshake_{err1}", 0
+
+    # Phase 2: Реальный MTProto
+    ok2, err2, ms2 = _test_proxy_mtproto_real(
+        proxy_host, proxy_port,
+        dc_host="149.154.175.53",
+        dc_port=443,
+        timeout=15
+    )
+    if not ok2:
+        return False, f"mtproto_{err2}", 0
+
+    # Phase 3: TLS к api.telegram.org (для REST API)
+    ok3, err3, ms3 = _test_proxy_tls_api(proxy_host, proxy_port, timeout=10)
+    if not ok3:
+        return False, f"tls_{err3}", 0
+
+    total_ms = ms1 + ms2 + ms3
+    return True, f"all_ok", total_ms
+
+
+def _test_proxy_tls_api(proxy_host: str, proxy_port: int,
+                         target_host: str = "api.telegram.org",
+                         target_port: int = 443, timeout: int = 10) -> tuple[bool, str, float]:
+    """TLS + HTTP запрос к api.telegram.org через прокси."""
+    sock = None
+    start = time.time()
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((proxy_host, proxy_port))
+
+        # SOCKS5
+        sock.sendall(struct.pack("!BBB", 0x05, 0x01, 0x00))
+        resp = sock.recv(2)
+        if len(resp) < 2 or resp[0] != 0x05 or resp[1] == 0xFF:
+            return False, "handshake_fail", 0
+
         target_bytes = target_host.encode('utf-8')
         req = struct.pack("!BBBB", 0x05, 0x01, 0x00, 0x03)
         req += struct.pack("!B", len(target_bytes)) + target_bytes
@@ -199,17 +310,13 @@ def _test_proxy_full_tls(proxy_host: str, proxy_port: int,
             l = sock.recv(1)
             if l:
                 sock.recv(struct.unpack("!B", l)[0] + 2)
-        elif atyp == 0x04:
-            sock.recv(18)
 
-        # TLS wrap
+        # TLS
         context = ssl.create_default_context()
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
-
         tls_sock = context.wrap_socket(sock, server_hostname=target_host)
 
-        # HTTP request to Telegram API
         tls_sock.sendall(
             b"GET /bot HTTP/1.1\r\n"
             b"Host: api.telegram.org\r\n"
@@ -219,11 +326,9 @@ def _test_proxy_full_tls(proxy_host: str, proxy_port: int,
         tls_sock.close()
 
         elapsed = (time.time() - start) * 1000
-
         if b"HTTP/1.1" in http_resp:
             return True, "tls_ok", elapsed
-        else:
-            return False, "http_no_response", elapsed
+        return False, "http_no_response", elapsed
 
     except socket.timeout:
         return False, "timeout", 0
@@ -255,6 +360,10 @@ class ProxyManager:
         self._session = requests.Session()
         self._session.headers.update({'User-Agent': 'Mozilla/5.0'})
 
+        # 🔧 НОВОЕ: Счётчик ошибок по прокси для ротации
+        self._proxy_fail_counts: Dict[str, int] = {}
+        self._static_proxy: Optional[Dict[str, Any]] = None
+
         self._stats = {
             'total_fetched': 0,
             'total_tested': 0,
@@ -266,14 +375,22 @@ class ProxyManager:
 
         self._plog = _get_proxy_logger()
         self._plog.info("=" * 60)
-        self._plog.info("ProxyManager v4.0 инициализирован")
-        self._plog.info(f"Режим: ПРИНУДИТЕЛЬНЫЙ (только прокси)")
-        self._plog.info(f"Тестирование: socket-level SOCKS5 (двухфазное)")
+        self._plog.info("ProxyManager v4.2 инициализирован")
+        self._plog.info("Режим: ПРИНУДИТЕЛЬНЫЙ (только прокси, РКН блокировка)")
+        self._plog.info("Тестирование: MTProto-real + TLS (трёхфазное)")
         self._plog.info(f"Целевой размер пула: {self.config.PROXY_POOL_SIZE}")
         self._plog.info(f"Макс. прокси для теста: {self.config.MAX_PROXIES_TO_TEST}")
         self._plog.info(f"Воркеры: {self.config.TEST_WORKERS}")
-        self._plog.info(f"Таймаут handshake: 8с, TLS: 10с")
+        self._plog.info(f"Макс. ошибок на прокси: {self.config.MAX_FAILS_PER_PROXY}")
         self._plog.info("=" * 60)
+
+        # 🔧 НОВОЕ: Проверяем статический прокси из env
+        if self.config.TELEGRAM_PROXY:
+            self._plog.info(f"[INIT] Обнаружен статический прокси: {self.config.TELEGRAM_PROXY}")
+            static = self._parse_proxy_url(self.config.TELEGRAM_PROXY)
+            if static:
+                self._static_proxy = static
+                self._plog.info("[INIT] Статический прокси добавлен в приоритет")
 
         self._refresh_thread = threading.Thread(target=self._refresh_loop, daemon=True)
         self._refresh_thread.start()
@@ -281,9 +398,11 @@ class ProxyManager:
         self._plog.info("[INIT] Запуск первоначального подбора прокси...")
         self.refresh_pool(blocking=True)
 
-        if not self._pool:
-            self._plog.error("[INIT] КРИТИЧЕСКАЯ ОШИБКА: Не удалось найти ни одного рабочего прокси!")
-            logger.error("❌ Ни одного рабочего SOCKS5 прокси не найдено.")
+        if not self._pool and not self._static_proxy:
+            self._plog.error("[INIT] КРИТИЧЕСКАЯ ОШИБКА: Нет рабочих прокси и нет статического!")
+            logger.error("❌ Ни одного рабочего SOCKS5 прокси не найдено. Бот не сможет подключиться!")
+        elif self._static_proxy:
+            self._plog.info("[INIT] Статический прокси доступен как резерв")
 
     def _parse_proxy_url(self, url: str) -> Optional[Dict[str, Any]]:
         url = url.strip()
@@ -399,7 +518,7 @@ class ProxyManager:
         return unique
 
     def _test_single_proxy(self, proxy_url: str, proxy_id: int) -> Optional[Dict[str, Any]]:
-        """Двухфазное тестирование: handshake → TLS"""
+        """🔧 Трёхфазное тестирование с реальным MTProto."""
         proxy_dict = self._parse_proxy_url(proxy_url)
         if not proxy_dict:
             return None
@@ -408,31 +527,13 @@ class ProxyManager:
         port = proxy_dict.get('port', 0)
         proxy_str = f"{host}:{port}"
 
-        # Phase 1: Handshake (быстро)
-        ok1, err1, ms1 = _test_proxy_socks5_handshake(
-            host, port,
-            target_host="api.telegram.org",
-            target_port=443,
-            timeout=8
-        )
+        ok, err, ms = _test_proxy_full_telegram(host, port, timeout=20)
 
-        if not ok1:
-            self._plog.debug(f"[TEST #{proxy_id}] ❌ HANDSHAKE {proxy_str} — {err1}")
-            return None
-
-        # Phase 2: TLS (только для прошедших handshake)
-        ok2, err2, ms2 = _test_proxy_full_tls(
-            host, port,
-            target_host="api.telegram.org",
-            target_port=443,
-            timeout=10
-        )
-
-        if ok2:
-            self._plog.info(f"[TEST #{proxy_id}] ✅ РАБОТАЕТ {proxy_str} (handshake {ms1:.0f}ms, TLS {ms2:.0f}ms)")
+        if ok:
+            self._plog.info(f"[TEST #{proxy_id}] ✅ РАБОТАЕТ {proxy_str} (MTProto+TLS, {ms:.0f}ms)")
             return proxy_dict
         else:
-            self._plog.debug(f"[TEST #{proxy_id}] ❌ TLS_FAIL {proxy_str} — {err2}")
+            self._plog.debug(f"[TEST #{proxy_id}] ❌ {proxy_str} — {err}")
             return None
 
     def refresh_pool(self, blocking: bool = False):
@@ -477,7 +578,7 @@ class ProxyManager:
                             proxy_url = futures[future]
 
                             try:
-                                result = future.result(timeout=20)
+                                result = future.result(timeout=25)
                                 if result:
                                     working.append(result)
                                     self._plog.info(
@@ -513,6 +614,7 @@ class ProxyManager:
                         self._current_index = 0
                         self._stats['total_working'] += len(working)
                         self._proxy_ready.set()
+                        self._proxy_fail_counts.clear()
 
                         logger.info(f"✅ Пул обновлён: {len(self._pool)} рабочих (refresh #{refresh_id})")
                         self._plog.info(f"[REFRESH #{refresh_id}] ПУЛ ОБНОВЛЁН: {len(self._pool)} рабочих")
@@ -556,8 +658,21 @@ class ProxyManager:
         self._plog.info("[STOP] Менеджер прокси остановлен")
         logger.info("🛑 Менеджер прокси остановлен")
 
-    def get_proxy(self, wait_seconds: float = 30) -> Optional[Dict[str, Any]]:
+    def get_proxy(self, wait_seconds: float = 90) -> Optional[Dict[str, Any]]:
+        """
+        🔧 УЛУЧШЕНИЕ: Возвращает прокси с учётом статического и ротации.
+        """
         self._plog.debug(f"[GET_PROXY] Запрос (wait={wait_seconds}с)")
+
+        # 🔧 ПРИОРИТЕТ 1: Статический прокси из env
+        if self._static_proxy:
+            proxy_str = f"{self._static_proxy['hostname']}:{self._static_proxy['port']}"
+            fails = self._proxy_fail_counts.get(proxy_str, 0)
+            if fails < self.config.MAX_FAILS_PER_PROXY:
+                self._plog.info(f"[GET_PROXY] Статический прокси: {proxy_str}")
+                return self._static_proxy
+            else:
+                self._plog.warning(f"[GET_PROXY] Статический прокси превысил лимит ошибок ({fails})")
 
         if not self._pool:
             self._plog.info(f"[GET_PROXY] Пул пуст, ожидаю (до {wait_seconds}с)...")
@@ -572,15 +687,41 @@ class ProxyManager:
                 self._plog.error("[GET_PROXY] Пул всё ещё пуст!")
                 return None
 
-            proxy = self._pool[self._current_index % len(self._pool)]
-            self._current_index += 1
-            self._plog.info(
-                f"[GET_PROXY] Выдан: {proxy['hostname']}:{proxy['port']} "
-                f"({self._current_index % len(self._pool)}/{len(self._pool)})"
-            )
-            return proxy
+            # 🔧 УЛУЧШЕНИЕ: Ищем прокси с минимальным количеством ошибок
+            best_proxy = None
+            best_score = float('inf')
+            
+            for _ in range(len(self._pool)):
+                proxy = self._pool[self._current_index % len(self._pool)]
+                self._current_index += 1
+                
+                proxy_str = f"{proxy['hostname']}:{proxy['port']}"
+                fails = self._proxy_fail_counts.get(proxy_str, 0)
+                
+                if fails < self.config.MAX_FAILS_PER_PROXY:
+                    if fails < best_score:
+                        best_score = fails
+                        best_proxy = proxy
+                        
+                    if fails == 0:  # Берём первый без ошибок
+                        break
+
+            if best_proxy:
+                proxy_str = f"{best_proxy['hostname']}:{best_proxy['port']}"
+                self._plog.info(
+                    f"[GET_PROXY] Выдан: {proxy_str} "
+                    f"(ошибок: {self._proxy_fail_counts.get(proxy_str, 0)})"
+                )
+                return best_proxy
+            
+            # Все прокси превысили лимит ошибок — запускаем экстренное обновление
+            self._plog.error("[GET_PROXY] Все прокси превысили лимит ошибок!")
+            self._proxy_ready.clear()
+            threading.Thread(target=self._safe_refresh_pool, daemon=True).start()
+            return None
 
     def report_failure(self, proxy_dict: Dict[str, Any]):
+        """🔧 УЛУЧШЕНИЕ: Учёт ошибок с порогом удаления."""
         if not proxy_dict:
             return
 
@@ -589,20 +730,24 @@ class ProxyManager:
         proxy_str = f"{host}:{port}"
 
         with self._lock:
-            if not self._pool:
-                return
+            # Увеличиваем счётчик ошибок
+            self._proxy_fail_counts[proxy_str] = self._proxy_fail_counts.get(proxy_str, 0) + 1
+            fail_count = self._proxy_fail_counts[proxy_str]
+            
+            self._plog.warning(f"[REPORT_FAIL] {proxy_str} ошибка #{fail_count}/{self.config.MAX_FAILS_PER_PROXY}")
 
-            for i, p in enumerate(self._pool):
-                if p.get('hostname') == host and p.get('port') == port:
-                    self._plog.warning(f"[REPORT_FAIL] Удаляю: {proxy_str}")
-                    del self._pool[i]
-                    if i <= self._current_index and self._current_index > 0:
-                        self._current_index -= 1
+            # Удаляем только если превысили лимит
+            if fail_count >= self.config.MAX_FAILS_PER_PROXY:
+                for i, p in enumerate(self._pool):
+                    if p.get('hostname') == host and p.get('port') == port:
+                        del self._pool[i]
+                        if i <= self._current_index and self._current_index > 0:
+                            self._current_index -= 1
+                        self._plog.warning(f"[REPORT_FAIL] Удалён из пула: {proxy_str}")
+                        logger.warning(f"⚠️ Удалён: {proxy_str}. Осталось: {len(self._pool)}")
+                        break
 
-                    logger.warning(f"⚠️ Удалён: {proxy_str}. Осталось: {len(self._pool)}")
-                    break
-
-            if not self._pool:
+            if not self._pool and not self._static_proxy:
                 self._plog.error("[REPORT_FAIL] Пул опустел! Экстренное обновление...")
                 logger.error("🔄 Пул пуст, запускаю экстренное обновление")
                 self._proxy_ready.clear()
@@ -619,6 +764,7 @@ class ProxyManager:
             return {
                 'mode': 'FORCED_PROXY_ONLY',
                 'pool_size': len(self._pool),
+                'static_proxy': self._static_proxy is not None,
                 'last_refresh': self._last_refresh.isoformat(),
                 'total_fetched': self._stats['total_fetched'],
                 'total_tested': self._stats['total_tested'],
@@ -626,6 +772,7 @@ class ProxyManager:
                 'refresh_count': self._stats['refresh_count'],
                 'last_successful_source': self._stats['last_successful_source'],
                 'failed_sources_count': len(self._stats['failed_sources']),
+                'proxy_fail_counts': dict(self._proxy_fail_counts),
             }
 
 

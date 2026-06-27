@@ -65,6 +65,7 @@ class PyrogramKeywordBot:
         self._proxy_connect_attempts = 0
         self._max_proxy_attempts = 10  # 🔧 Увеличили
         self._current_proxy: Optional[Dict[str, Any]] = None
+        self._message_handler = None
 
     def _load_channel_cache(self) -> Dict[str, int]:
         if os.path.exists(self._channel_cache_path):
@@ -300,6 +301,7 @@ class PyrogramKeywordBot:
                         self.monitor.dedup_window_hours = new_config.dedup_window_hours
 
                         self._resolved_channels = await self._resolve_all_channels()
+                        self._register_message_handler(self._resolved_channels)
                         self.logger.info(
                             f"🔄 Конфиг обновлён. Каналов: {len(self._resolved_channels)}, "
                             f"Ключевых слов: {len(self.config.keywords)}"
@@ -355,6 +357,31 @@ class PyrogramKeywordBot:
             )
         except Exception:
             return self.config.channel_id
+
+    def _register_message_handler(self, resolved_channels: List[int]) -> None:
+        if not self._client:
+            return
+
+        if self._message_handler is not None:
+            try:
+                self._client.remove_handler(self._message_handler)
+            except Exception:
+                pass
+            self._message_handler = None
+
+        @self._client.on_message(filters.all)
+        async def message_handler(client: Client, message: Message):
+            if not self._resolved_channels:
+                return
+            if message.chat and message.chat.id not in self._resolved_channels:
+                return
+            await self._handle_new_message(client, message)
+
+        self._message_handler = message_handler
+        self.logger.info(
+            f"👂 Активные каналы для обработки: {len(self._resolved_channels)} | "
+            f"IDs: {self._resolved_channels}"
+        )
 
     async def start(self):
         self._running = True
@@ -430,15 +457,7 @@ class PyrogramKeywordBot:
             if self._resolved_channels:
                 await self._send_startup_test()
 
-            @self._client.on_message(
-                filters.chat(self._resolved_channels) if self._resolved_channels else filters.all
-            )
-            async def message_handler(client: Client, message: Message):
-                if not self._resolved_channels:
-                    return
-                if message.chat and message.chat.id not in self._resolved_channels:
-                    return
-                await self._handle_new_message(client, message)
+            self._register_message_handler(self._resolved_channels)
 
             if self._resolved_channels:
                 self.logger.info(f"👂 Мониторинг {len(self._resolved_channels)} каналов...")

@@ -14,7 +14,8 @@ config.key
 # Python
 __pycache__/
 *.pyc
-venv/bot_session.session
+.venv/
+bot_session.session
 bot_session.session-journal
 channel_cache.json
 config.ini

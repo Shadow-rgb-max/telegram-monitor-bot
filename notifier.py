@@ -27,7 +27,7 @@ async def send_notification(
     await client.send_message(
         recipient_id,
         notification,
-        parse_mode="HTML",
+        parse_mode="html",
         disable_web_page_preview=False
     )
 
@@ -46,7 +46,7 @@ async def send_error_notification(
         await client.send_message(
             recipient_id,
             f"⚠️ <b>[ОШИБКА]</b>\n<pre>{safe_error}</pre>",
-            parse_mode="HTML"
+            parse_mode="html"
         )
     except Exception as e:
         logging.getLogger("telegram_keyword_monitor").error(

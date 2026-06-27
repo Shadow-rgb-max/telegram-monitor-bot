@@ -12,6 +12,7 @@ import sqlite3
 from typing import List, Optional, Dict, Any
 
 from pyrogram import Client, filters, idle, utils as pyrogram_utils
+from pyrogram.enums import ParseMode
 from pyrogram.types import Message
 from pyrogram.errors import (
     FloodWait,
@@ -196,7 +197,7 @@ class PyrogramKeywordBot:
             self._channel_cache[channel] = chat_id
             self._save_channel_cache()
             self.logger.info(f"✅ Канал {channel} разрешён → ID: {chat_id}")
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.05)
             return chat_id
         except FloodWait as e:
             self.logger.warning(f"⏱ FloodWait при разрешении {channel}: жду {e.value} сек.")
@@ -218,7 +219,7 @@ class PyrogramKeywordBot:
             chat_id = await self._resolve_channel(channel)
             if chat_id:
                 resolved.append(chat_id)
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(0.3)
         return resolved
 
     async def _handle_new_message(self, client: Client, message: Message):
@@ -328,8 +329,8 @@ class PyrogramKeywordBot:
                 f"📡 {proxy_info}\n"
                 f"📊 Каналов: {len(self._resolved_channels)}\n"
                 f"🔍 Ключевых слов: {len(self.config.keywords)}\n"
-                f"⏰ Окно дедупликации: {self.config.dedup_window_hours}ч",
-                parse_mode="HTML"
+                    f"⏰ Окно дедупликации: {self.config.dedup_window_hours}ч",
+                    parse_mode=ParseMode.HTML
             )
             self.logger.info("✅ Тестовое сообщение отправлено")
         except Exception as e:
@@ -396,7 +397,7 @@ class PyrogramKeywordBot:
                     await self._client.send_message(
                         self._get_channel_id(),
                         "⚠️ <b>Внимание</b>\nНи один из указанных каналов не доступен.",
-                        parse_mode="HTML"
+                        parse_mode=ParseMode.HTML
                     )
                 except Exception:
                     pass

@@ -2,6 +2,8 @@ import asyncio
 import configparser
 import os
 from aiogram import Bot, Dispatcher, types
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -10,9 +12,77 @@ from cryptography.fernet import Fernet
 import re
 import logging
 
+# --- Настройка логирования ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [EDIT_CONFIG_BOT] %(levelname)s %(message)s',
+    handlers=[
+        logging.FileHandler("bot.log", encoding="utf-8"),
+        logging.StreamHandler()
+    ],
+    force=True
+)
+logger = logging.getLogger(__name__)
+
+from proxy_manager import get_static_proxy
+
 BOT_TOKEN = "7759801792:AAG890Wu4jGsMhonv299pUwaVi6KQYACuiI"
 CONFIG_PATH = "config.ini"
 KEY_PATH = "config.key"
+
+
+def build_proxy_url(proxy_config: dict | None) -> str | None:
+    if not proxy_config:
+        return None
+
+    scheme = proxy_config.get("scheme") or "http"
+    hostname = proxy_config.get("hostname")
+    port = proxy_config.get("port")
+    username = proxy_config.get("username")
+    password = proxy_config.get("password")
+
+    if not hostname or not port:
+        return None
+
+    auth = ""
+    if username:
+        auth = username
+        if password:
+            auth = f"{username}:{password}"
+        auth += "@"
+
+    return f"{scheme}://{auth}{hostname}:{port}"
+
+
+def build_proxy_session(proxy_url: str | None) -> AiohttpSession | None:
+    if not proxy_url:
+        return None
+
+    try:
+        session = AiohttpSession(proxy=proxy_url)
+        connector_init = getattr(session, "_connector_init", None)
+        if isinstance(connector_init, dict):
+            connector_init["rdns"] = False
+            logger.info("[EDIT_CONFIG_BOT] Установлен rdns=False для AiohttpSession proxy connector")
+        return session
+    except Exception as exc:
+        logger.error(
+            f"[EDIT_CONFIG_BOT] Ошибка создания proxy AiohttpSession для {proxy_url}: {exc}",
+            exc_info=True,
+        )
+        return None
+
+
+logger.info("[EDIT_CONFIG_BOT] Начинаю инициализацию конфигурации прокси")
+STATIC_PROXY = get_static_proxy()
+STATIC_PROXY_URL = build_proxy_url(STATIC_PROXY)
+logger.info(f"[EDIT_CONFIG_BOT] Прочитан статический прокси из get_static_proxy(): {STATIC_PROXY}")
+logger.info(f"[EDIT_CONFIG_BOT] Построен STATIC_PROXY_URL: {STATIC_PROXY_URL}")
+
+if STATIC_PROXY_URL:
+    logger.info(f"[EDIT_CONFIG_BOT] Использую статический прокси: {STATIC_PROXY_URL}")
+else:
+    logger.info("[EDIT_CONFIG_BOT] Статический прокси не настроен. Используется прямое подключение.")
 
 # --- Вспомогательные функции для работы с config.ini ---
 def load_key(key_path: str = KEY_PATH) -> bytes:
@@ -73,7 +143,16 @@ def save_config_parser(config: configparser.ConfigParser):
         raise
 
 # --- Telegram Bot ---
-bot = Bot(token=BOT_TOKEN)
+proxy_session = build_proxy_session(STATIC_PROXY_URL) if STATIC_PROXY_URL else None
+logger.info(
+    f"[EDIT_CONFIG_BOT] Создаю aiohttp сессию для бота, proxy_session={'enabled' if proxy_session else 'disabled'}"
+)
+try:
+    bot = Bot(token=BOT_TOKEN, session=proxy_session) if proxy_session else Bot(token=BOT_TOKEN)
+except Exception as exc:
+    logger.error(f"[EDIT_CONFIG_BOT] Ошибка создания Bot с proxy_session={bool(proxy_session)}: {exc}", exc_info=True)
+    logger.info("[EDIT_CONFIG_BOT] Пытаюсь создать Bot без proxy")
+    bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 
@@ -81,18 +160,6 @@ class ConfigEditStates(StatesGroup):
     waiting_channels = State()
     waiting_keywords = State()
     waiting_dedup_window = State()
-
-# --- Настройка логирования ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [EDIT_CONFIG_BOT] %(levelname)s %(message)s',
-    handlers=[
-        logging.FileHandler("bot.log", encoding="utf-8"),
-        logging.StreamHandler()  # Вывод в stdout для docker logs
-    ],
-    force=True  # Перезаписываем существующую конфигурацию
-)
-logger = logging.getLogger(__name__)
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -123,7 +190,7 @@ async def cmd_view(message: types.Message):
             f"Текущие monitored channels:\n<code>{channels}</code>\n\n"
             f"Текущие keywords:\n<code>{keywords}</code>\n\n"
             f"Окно дедупликации: <code>{dedup_window} часов</code>",
-            parse_mode="HTML"
+            parse_mode="html"
         )
     except Exception as e:
         logger.error(f"Ошибка в /view: {e}")
@@ -271,4 +338,23 @@ async def process_dedup_window(msg: types.Message, state: FSMContext):
 
 if __name__ == "__main__":
     logger.info("Запуск edit_config_bot.py")
-    asyncio.run(dp.start_polling(bot))
+    logger.info(f"[EDIT_CONFIG_BOT] BOT_TOKEN present: {'yes' if BOT_TOKEN else 'no'}")
+    logger.info(f"[EDIT_CONFIG_BOT] CONFIG_PATH: {CONFIG_PATH}, KEY_PATH: {KEY_PATH}")
+    logger.info(f"[EDIT_CONFIG_BOT] Начинаю запуск polling, proxy_session={'enabled' if STATIC_PROXY_URL else 'disabled'}")
+    try:
+        asyncio.run(dp.start_polling(bot))
+    except TelegramNetworkError as exc:
+        logger.exception(f"[EDIT_CONFIG_BOT] TelegramNetworkError при запуске polling: {exc}")
+        if STATIC_PROXY_URL:
+            logger.info("[EDIT_CONFIG_BOT] Попытка перезапуска без proxy...")
+            proxy_session = None
+            bot = Bot(token=BOT_TOKEN)
+            dp = Dispatcher(storage=MemoryStorage())
+            try:
+                asyncio.run(dp.start_polling(bot))
+            except Exception as exc2:
+                logger.exception(f"[EDIT_CONFIG_BOT] Ошибка запуска polling без proxy: {exc2}")
+    except Exception as exc:
+        logger.exception(f"[EDIT_CONFIG_BOT] Ошибка запуска polling: {exc}")
+    finally:
+        logger.info("[EDIT_CONFIG_BOT] Завершено выполнение edit_config_bot.py")

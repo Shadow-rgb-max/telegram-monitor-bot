@@ -28,7 +28,6 @@ from pyrogram.errors import (
 from config import BotConfig, get_config
 from keyword_monitor import KeywordMonitor
 from notifier import send_notification, send_error_notification
-from proxy_manager import get_proxy_manager
 
 logger = logging.getLogger("telegram_keyword_monitor")
 
@@ -96,7 +95,7 @@ class PyrogramKeywordBot:
         }
 
         if proxy:
-            self.logger.info(f"🔌 Pyrogram Client с SOCKS5 прокси: {proxy.get('hostname')}:{proxy.get('port')}")
+            self.logger.info(f"🔌 Pyrogram Client с прокси ({proxy.get('scheme')}): {proxy.get('hostname')}:{proxy.get('port')}")
             client_kwargs["proxy"] = proxy
         else:
             self.logger.info("🔌 Pyrogram Client без прокси")
@@ -113,12 +112,12 @@ class PyrogramKeywordBot:
             return None
 
         parsed = urlparse(proxy_url)
-        if parsed.scheme not in ('socks5', 'socks5h'):
-            self.logger.warning(f"⚠️ Неподдерживаемый тип прокси: {parsed.scheme}")
+        if not parsed.scheme or not parsed.hostname:
+            self.logger.warning(f"⚠️ Некорректный URL прокси: {proxy_url}")
             return None
 
         proxy_dict = {
-            "scheme": "socks5",
+            "scheme": parsed.scheme,
             "hostname": parsed.hostname,
             "port": parsed.port or 1080,
         }
@@ -319,12 +318,9 @@ class PyrogramKeywordBot:
 
     async def _send_startup_test(self):
         try:
-            proxy_manager = get_proxy_manager()
-            stats = proxy_manager.get_stats()
-            
-            proxy_info = f"SOCKS5 пул: {stats['pool_size']} прокси"
-            if stats.get('static_proxy'):
-                proxy_info += " (+ статический)"
+            proxy_info = "Без прокси"
+            if self._current_proxy:
+                proxy_info = f"Прокси ({self._current_proxy.get('scheme')}): {self._current_proxy.get('hostname')}:{self._current_proxy.get('port')}"
 
             await self._client.send_message(
                 self._get_channel_id(),
@@ -352,19 +348,13 @@ class PyrogramKeywordBot:
     async def start(self):
         self._running = True
 
-        # 🔧 ПРИОРИТЕТ 1: Статический прокси из env
+        # Используем только статический прокси из env
         proxy = self._get_static_proxy()
 
         if proxy:
             self.logger.info(f"✅ Использую статический прокси: {proxy['hostname']}:{proxy['port']}")
         else:
-            self.logger.info("🔍 Статический прокси не найден, пробую ProxyManager...")
-            proxy_manager = get_proxy_manager()
-            proxy = proxy_manager.get_proxy(wait_seconds=90)
-
-        if not proxy:
-            self.logger.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Нет прокси!")
-            return
+            self.logger.info("ℹ️ Статический прокси не найден, подключение без прокси")
 
         self._current_proxy = proxy
 

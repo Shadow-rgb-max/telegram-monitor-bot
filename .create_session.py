@@ -98,7 +98,7 @@ def get_api_credentials():
 def show_qr(url: str, save_path: str = "qr_login.png"):
     """Показывает QR-код в терминале или сохраняет в PNG."""
     try:
-        import qrcode
+        import qrcode # type: ignore
         qr = qrcode.QRCode(box_size=1, border=1, error_correction=qrcode.constants.ERROR_CORRECT_L)
         qr.add_data(url)
         qr.make(fit=True)

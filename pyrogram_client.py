@@ -12,7 +12,7 @@ import sqlite3
 from typing import List, Optional, Dict, Any
 
 from pyrogram import Client, filters, idle, utils as pyrogram_utils
-from pyrogram.enums import ParseMode
+from pyrogram.enums import ChatType, ParseMode
 from pyrogram.types import Message
 from pyrogram.errors import (
     FloodWait,
@@ -222,9 +222,19 @@ class PyrogramKeywordBot:
             await asyncio.sleep(0.3)
         return resolved
 
+    def _is_supported_chat_type(self, chat_type: Any) -> bool:
+        if chat_type is None:
+            return False
+
+        if isinstance(chat_type, ChatType):
+            return chat_type in {ChatType.CHANNEL, ChatType.SUPERGROUP}
+
+        chat_type_str = str(chat_type).lower()
+        return chat_type_str in {"channel", "supergroup", "chattype.channel", "chattype.supergroup"}
+
     async def _handle_new_message(self, client: Client, message: Message):
         try:
-            if not message.chat or message.chat.type not in ("channel", "supergroup"):
+            if not message.chat or not self._is_supported_chat_type(getattr(message.chat, "type", None)):
                 return
 
             chat_id = message.chat.id
@@ -467,7 +477,7 @@ class PyrogramKeywordBot:
                 self.logger.error(f"❌ Ошибка при отключении: {e}")
 
         try:
-            from proxy_manager import PROXY_MANAGER
+            from proxy_manager import PROXY_MANAGER # pyright: ignore[reportUnknownVariableType]
             if PROXY_MANAGER:
                 PROXY_MANAGER.stop()
         except Exception:

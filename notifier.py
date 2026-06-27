@@ -1,4 +1,5 @@
 from pyrogram import Client
+from pyrogram.enums import ParseMode
 from typing import List, Union
 import logging
 
@@ -27,7 +28,7 @@ async def send_notification(
     await client.send_message(
         recipient_id,
         notification,
-        parse_mode="html",
+        parse_mode=ParseMode.HTML,
         disable_web_page_preview=False
     )
 
@@ -46,7 +47,7 @@ async def send_error_notification(
         await client.send_message(
             recipient_id,
             f"⚠️ <b>[ОШИБКА]</b>\n<pre>{safe_error}</pre>",
-            parse_mode="html"
+            parse_mode=ParseMode.HTML
         )
     except Exception as e:
         logging.getLogger("telegram_keyword_monitor").error(

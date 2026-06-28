@@ -169,6 +169,7 @@ class PyrogramKeywordBot:
         if channel.lstrip("-").isdigit():
             return int(channel)
 
+        # Приватные ссылки
         if channel.startswith("https://t.me/+") or channel.startswith("t.me/+"):
             invite_hash = channel.split("+")[-1]
             try:
@@ -178,15 +179,23 @@ class PyrogramKeywordBot:
                 self._save_channel_cache()
                 self.logger.info(f"✅ Приватный канал {channel} разрешён → ID: {chat_id}")
                 return chat_id
-            except (UsernameInvalid, UsernameNotOccupied) as e:
-                self.logger.warning(f"⚠️ Приватная ссылка {channel} недействительна: {e}")
-                return None
             except Exception as e:
                 self.logger.error(f"❌ Ошибка join_chat для {channel}: {e}")
                 return None
 
+        # === ПУБЛИЧНЫЕ КАНАЛЫ: подписываемся принудительно ===
+        username = channel.lstrip("@")
         try:
-            peer = await self._client.resolve_peer(channel.lstrip("@"))
+            # Сначала подписываемся (если ещё не подписан — ошибка, игнорируем)
+            try:
+                await self._client.join_chat(username)
+                self.logger.info(f"✅ Подписался на {channel}")
+            except Exception as join_err:
+                # USER_ALREADY_PARTICIPANT или другие ошибки — не критично
+                self.logger.debug(f"ℹ️ join_chat для {channel}: {join_err}")
+
+            # Теперь resolve для получения ID
+            peer = await self._client.resolve_peer(username)
             if hasattr(peer, 'channel_id'):
                 chat_id = int(f"-100{peer.channel_id}")
             elif hasattr(peer, 'chat_id'):
@@ -200,6 +209,7 @@ class PyrogramKeywordBot:
             self.logger.info(f"✅ Канал {channel} разрешён → ID: {chat_id}")
             await asyncio.sleep(0.05)
             return chat_id
+
         except FloodWait as e:
             self.logger.warning(f"⏱ FloodWait при разрешении {channel}: жду {e.value} сек.")
             await asyncio.sleep(e.value)
@@ -371,6 +381,13 @@ class PyrogramKeywordBot:
 
         @self._client.on_message(filters.all)
         async def message_handler(client: Client, message: Message):
+            chat_id = message.chat.id if message.chat else "N/A"
+            chat_type = message.chat.type if message.chat else "N/A"
+            self.logger.info(
+                f"[RAW UPDATE] chat_id={chat_id} | type={chat_type} | "
+                f"text_preview={str(message.text or message.caption)[:100]}"
+            )
+
             if not self._resolved_channels:
                 return
             if message.chat and message.chat.id not in self._resolved_channels:

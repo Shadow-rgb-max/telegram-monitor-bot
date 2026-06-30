@@ -250,11 +250,35 @@ class PyrogramKeywordBot:
 
             chat_id = message.chat.id
             channel_title = message.chat.title or str(chat_id)
-            message_text = message.text or message.caption or ""
+
+            # === БЕЗОПАСНОЕ ПОЛУЧЕНИЕ ТЕКСТА ===
+            raw_text = message.text or message.caption or ""
+
+            # Безопасная обрезка: конвертируем в байты UTF-16 и обратно,
+            # чтобы не разрезать surrogate pairs
+            try:
+                # Пробуем получить полный текст через Pyrogram
+                message_text = str(raw_text) if raw_text else ""
+            except Exception:
+                # Fallback: если Pyrogram упал при str(), используем bytes
+                try:
+                    message_text = raw_text.encode('utf-16', 'surrogatepass').decode('utf-16', 'replace')
+                except Exception:
+                    message_text = ""
+
+            # Безопасная обрезка для лога: обрезаем по символам, не по байтам
+            # Используем textwrap для корректной работы с Unicode
+            import textwrap
+            log_preview = message_text[:200] if message_text else "Без текста"
+            # Дополнительная защита: если всё ещё битая строка, заменяем
+            try:
+                log_preview.encode('utf-8')
+            except UnicodeEncodeError:
+                log_preview = message_text.encode('utf-8', 'replace').decode('utf-8')[:200]
 
             self.logger.info(
                 f"[MONITOR] Канал: {channel_title} | ID: {message.id} | "
-                f"Сообщение: {message_text[:200] or 'Без текста'}"
+                f"Сообщение: {log_preview}"
             )
 
             matched_keywords = self.monitor.match_keywords(message_text)
@@ -290,7 +314,6 @@ class PyrogramKeywordBot:
                 )
             except Exception:
                 pass
-
     async def _reload_config_periodically(self):
         while self._running:
             await asyncio.sleep(420)

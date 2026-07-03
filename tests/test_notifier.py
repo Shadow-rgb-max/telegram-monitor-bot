@@ -1,8 +1,6 @@
 import asyncio
 import unittest
 
-from pyrogram.enums import ParseMode
-
 from notifier import send_notification
 
 
@@ -10,17 +8,17 @@ class DummyClient:
     def __init__(self):
         self.calls = []
 
-    async def send_message(self, chat_id, text, parse_mode=None, disable_web_page_preview=None):
+    async def send_message(self, entity, message, parse_mode=None, link_preview=None):
         self.calls.append({
-            "chat_id": chat_id,
-            "text": text,
+            "entity": entity,
+            "message": message,
             "parse_mode": parse_mode,
-            "disable_web_page_preview": disable_web_page_preview,
+            "link_preview": link_preview,
         })
 
 
 class NotifierTests(unittest.TestCase):
-    def test_send_notification_uses_pyrogram_html_parse_mode(self):
+    def test_send_notification_uses_html_parse_mode(self):
         client = DummyClient()
 
         asyncio.run(send_notification(
@@ -33,8 +31,8 @@ class NotifierTests(unittest.TestCase):
         ))
 
         self.assertEqual(len(client.calls), 1)
-        self.assertEqual(client.calls[0]["parse_mode"], ParseMode.HTML)
-        self.assertFalse(client.calls[0]["disable_web_page_preview"])
+        self.assertEqual(client.calls[0]["parse_mode"], "html")
+        self.assertTrue(client.calls[0]["link_preview"])
 
 
 if __name__ == "__main__":

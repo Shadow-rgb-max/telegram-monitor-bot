@@ -1,7 +1,7 @@
 import asyncio
 from config import get_config
 from logger import setup_logger
-from pyrogram_client import PyrogramKeywordBot
+from telethon_client import TelethonKeywordBot
 
 
 def main() -> None:
@@ -12,7 +12,7 @@ def main() -> None:
         logger.error(f"Ошибка чтения конфигурации: {e}")
         return
 
-    bot = PyrogramKeywordBot(config, logger)
+    bot = TelethonKeywordBot(config, logger)
 
     try:
         asyncio.run(bot.start())

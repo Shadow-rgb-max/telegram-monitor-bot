@@ -1,11 +1,11 @@
-from pyrogram import Client
-from pyrogram.enums import ParseMode
+from telethon import TelegramClient
 from typing import List, Union
 import logging
+import html
 
 
 async def send_notification(
-    client: Client,
+    client: TelegramClient,
     recipient_id: Union[int, str],
     channel_title: str,
     matched_keywords: List[str],
@@ -13,7 +13,6 @@ async def send_notification(
     message_link: str,
 ) -> None:
     """Отправляет уведомление о найденном ключевом слове."""
-    import html
     safe_text = html.escape(message_text[:4000]) if message_text else "Без текста"
     safe_title = html.escape(channel_title)
 
@@ -28,8 +27,8 @@ async def send_notification(
     await client.send_message(
         recipient_id,
         notification,
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=False
+        parse_mode="html",
+        link_preview=True,
     )
 
     logging.getLogger("telegram_keyword_monitor").info(
@@ -38,16 +37,15 @@ async def send_notification(
 
 
 async def send_error_notification(
-    client: Client, recipient_id: Union[int, str], error_text: str
+    client: TelegramClient, recipient_id: Union[int, str], error_text: str
 ) -> None:
     """Отправляет уведомление об ошибке."""
     try:
-        import html
         safe_error = html.escape(str(error_text)[:3000])
         await client.send_message(
             recipient_id,
             f"⚠️ <b>[ОШИБКА]</b>\n<pre>{safe_error}</pre>",
-            parse_mode=ParseMode.HTML
+            parse_mode="html",
         )
     except Exception as e:
         logging.getLogger("telegram_keyword_monitor").error(

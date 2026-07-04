@@ -2,6 +2,10 @@
 Клиент мониторинга Telegram-каналов на Telethon.
 Версия 4.0 — миграция с Pyrogram на Telethon для поддержки
 Fake-TLS MTProto прокси (в дополнение к обычному SOCKS5 через xray).
+
+Версия 4.2 — прокси-логика вынесена в telethon_factory.py (переиспользуется
+также отдельным процессом edit_config_bot.py, который обслуживает
+админ-команды под собственной сессией).
 """
 
 import asyncio
@@ -15,30 +19,26 @@ from telethon.tl.types import Channel
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 
-try:
-    import TelethonFakeTLS
-    _FAKETLS_AVAILABLE = True
-except ImportError:
-    _FAKETLS_AVAILABLE = False
-
-import socks  # pysocks, для обычного SOCKS5-прокси (xray)
-
 from config import BotConfig, get_config
 from keyword_monitor import KeywordMonitor
 from notifier import send_notification, send_error_notification
-from proxy_manager import get_static_proxy
+from telethon_factory import build_telethon_client, get_proxy_and_connection
 
 logger = logging.getLogger("telegram_keyword_monitor")
+
+SESSION_NAME = "bot_session"
 
 
 class TelethonKeywordBot:
     """
     Бот для мониторинга Telegram-каналов по ключевым словам (Telethon).
 
-    Приоритет выбора прокси:
-      1. Fake-TLS MTProxy из config.ini [Settings] mtproto_proxy = host:port:secret
-      2. Обычный SOCKS5 из переменной окружения TELEGRAM_PROXY (например, локальный xray)
-      3. Без прокси
+    Редактирование config.ini (view / set keywords / set channels / dedup)
+    вынесено в отдельный процесс edit_config_bot.py со своей сессией —
+    см. этот файл и admin_commands.py. Данный класс отвечает только за
+    мониторинг каналов и отправку уведомлений; изменения config.ini,
+    сохранённые другим процессом, подхватываются здесь автоматически
+    через периодический опрос mtime файла (см. _reload_config_periodically).
     """
 
     def __init__(self, config: BotConfig, logger: logging.Logger):
@@ -85,50 +85,10 @@ class TelethonKeywordBot:
     # ==================== Прокси / клиент ====================
 
     def _get_proxy_and_connection(self):
-        """Возвращает (proxy, connection_class) согласно приоритету, описанному в докстринге класса."""
-        if self.config.mtproto_proxy:
-            host, port, secret = self.config.mtproto_proxy
-            if not _FAKETLS_AVAILABLE:
-                self.logger.error(
-                    "❌ В config.ini задан mtproto_proxy, но пакет TelethonFakeTLS не установлен "
-                    "(pip install TelethonFakeTLS). Прокси проигнорирован."
-                )
-            else:
-                secret_clean = secret[2:] if secret.lower().startswith("ee") else secret
-                self.logger.info(f"🔌 Использую Fake-TLS MTProxy: {host}:{port}")
-                return (host, port, secret_clean), TelethonFakeTLS.ConnectionTcpMTProxyFakeTLS
-
-        static_proxy = get_static_proxy()  # TELEGRAM_PROXY / TELEGRAM_PROXY_URL, обычный SOCKS5
-        if static_proxy:
-            self.logger.info(
-                f"🔌 Использую SOCKS5: {static_proxy['hostname']}:{static_proxy['port']}"
-            )
-            proxy_tuple = (socks.SOCKS5, static_proxy["hostname"], static_proxy["port"])
-            if static_proxy.get("username"):
-                proxy_tuple = proxy_tuple + (
-                    True,
-                    static_proxy.get("username"),
-                    static_proxy.get("password"),
-                )
-            return proxy_tuple, None
-
-        self.logger.info("🔌 Подключение без прокси")
-        return None, None
+        return get_proxy_and_connection(self.config, self.logger)
 
     def _build_client(self) -> TelegramClient:
-        proxy, connection = self._get_proxy_and_connection()
-
-        kwargs: Dict[str, Any] = dict(
-            session="bot_session",
-            api_id=int(self.config.api_id),
-            api_hash=self.config.api_hash,
-        )
-        if proxy:
-            kwargs["proxy"] = proxy
-        if connection:
-            kwargs["connection"] = connection
-
-        return TelegramClient(**kwargs)
+        return build_telethon_client(SESSION_NAME, self.config, self.logger)
 
     # ==================== Разрешение каналов ====================
 
@@ -292,34 +252,48 @@ class TelethonKeywordBot:
 
     # ==================== Периодические задачи ====================
 
+    async def _reload_config_now(self) -> None:
+        """Перечитывает config.ini и, если что-то изменилось, применяет новые
+        значения "на лету" (без перезапуска процесса)."""
+        try:
+            mtime = os.path.getmtime(self._config_path)
+            new_config = get_config(self._config_path)
+
+            changed = (
+                new_config.channels != self.config.channels
+                or new_config.keywords != self.config.keywords
+                or new_config.dedup_window_hours != self.config.dedup_window_hours
+            )
+
+            if changed:
+                self.config.channels = new_config.channels
+                self.config.keywords = new_config.keywords
+                self.config.dedup_window_hours = new_config.dedup_window_hours
+                self.monitor.keywords = new_config.keywords
+                self.monitor.dedup_window_hours = new_config.dedup_window_hours
+
+                self._resolved_channels = await self._resolve_all_channels()
+                self._register_message_handler(self._resolved_channels)
+                self.logger.info(
+                    f"🔄 Конфиг обновлён. Каналов: {len(self._resolved_channels)}, "
+                    f"Ключевых слов: {len(self.config.keywords)}"
+                )
+
+            self._config_mtime = mtime
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка обновления конфига: {e}")
+
     async def _reload_config_periodically(self):
         while self._running:
             await asyncio.sleep(420)
             try:
                 mtime = os.path.getmtime(self._config_path)
                 if mtime != self._config_mtime:
-                    self.logger.info("📝 Обнаружено изменение config.ini. Перезагружаю...")
-                    new_config = get_config(self._config_path)
-
-                    if (
-                        new_config.channels != self.config.channels
-                        or new_config.keywords != self.config.keywords
-                        or new_config.dedup_window_hours != self.config.dedup_window_hours
-                    ):
-                        self.config.channels = new_config.channels
-                        self.config.keywords = new_config.keywords
-                        self.config.dedup_window_hours = new_config.dedup_window_hours
-                        self.monitor.keywords = new_config.keywords
-                        self.monitor.dedup_window_hours = new_config.dedup_window_hours
-
-                        self._resolved_channels = await self._resolve_all_channels()
-                        self._register_message_handler(self._resolved_channels)
-                        self.logger.info(
-                            f"🔄 Конфиг обновлён. Каналов: {len(self._resolved_channels)}, "
-                            f"Ключевых слов: {len(self.config.keywords)}"
-                        )
-
-                    self._config_mtime = mtime
+                    self.logger.info(
+                        "📝 Обнаружено изменение config.ini (вероятно, через edit_config_bot). "
+                        "Перезагружаю..."
+                    )
+                    await self._reload_config_now()
             except Exception as e:
                 self.logger.error(f"❌ Ошибка автообновления конфига: {e}")
 

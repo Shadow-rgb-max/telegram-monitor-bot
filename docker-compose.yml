@@ -8,6 +8,8 @@ services:
       - ./config.key:/app/config.key
       - ./bot_session.session:/app/bot_session.session
       - ./bot_session.session-journal:/app/bot_session.session-journal
+      - ./edit_config_session.session:/app/edit_config_session.session
+      - ./edit_config_session.session-journal:/app/edit_config_session.session-journal
       - ./channel_cache.json:/app/channel_cache.json
       - ./bot.log:/app/bot.log
     environment:
